@@ -646,8 +646,6 @@ void AgentContainer::moveAgentsToWork ()
 {
     BL_PROFILE("AgentContainer::moveAgentsToWork");
 
-    amrex::Print() << " moving agents to work. \n";
-
     for (int lev = 0; lev <= finestLevel(); ++lev)
     {
         const auto dx = Geom(lev).CellSizeArray();
@@ -687,8 +685,6 @@ void AgentContainer::moveAgentsToWork ()
 void AgentContainer::moveAgentsToHome ()
 {
     BL_PROFILE("AgentContainer::moveAgentsToHome");
-
-    amrex::Print() << " moving agents to home. \n";
 
     for (int lev = 0; lev <= finestLevel(); ++lev)
     {
@@ -808,8 +804,9 @@ void AgentContainer::updateStatus (MultiFab& disease_stats /*!< Community-wise d
             auto counter_ptr = soa.GetRealData(RealIdx::disease_counter).data();
             auto timer_ptr = soa.GetRealData(RealIdx::treatment_timer).data();
             auto prob_ptr = soa.GetRealData(RealIdx::prob).data();
-            //auto& aos   = ptile.GetArrayOfStructs();
-            //auto pstruct_ptr = aos.data();
+            auto incubation_period_ptr = soa.GetRealData(RealIdx::incubation_period).data();
+            auto infectious_period_ptr = soa.GetRealData(RealIdx::infectious_period).data();
+
             auto ds_arr = disease_stats[mfi].array();
 
             struct DiseaseStats
@@ -821,8 +818,6 @@ void AgentContainer::updateStatus (MultiFab& disease_stats /*!< Community-wise d
                     death
                 };
             };
-
-            auto* lparm = d_parm;
 
             // Track hospitalization, ICU, ventilator, and fatalities
             Real CHR[] = {.0104, .0104, .070, .28, 1.0};  // sick -> hospital probabilities
@@ -839,11 +834,11 @@ void AgentContainer::updateStatus (MultiFab& disease_stats /*!< Community-wise d
                 }
                 else if (status_ptr[i] == Status::infected) {
                     counter_ptr[i] += 1;
-                    if (counter_ptr[i] < lparm->incubation_length) {
+                    if (counter_ptr[i] < incubation_period_ptr[i]) {
                         // incubation phase
                         return;
                     }
-                    if (counter_ptr[i] == lparm->incubation_length) {
+                    if (counter_ptr[i] == amrex::Math::ceil(incubation_period_ptr[i])) {
                         // decide if hospitalized
                         Real p_hosp = CHR[age_group_ptr[i]];
                         if (amrex::Random(engine) < p_hosp) {
@@ -933,7 +928,7 @@ void AgentContainer::updateStatus (MultiFab& disease_stats /*!< Community-wise d
                             }
                         }
                         else { // not hospitalized, recover once not infectious
-                            if (counter_ptr[i] == lparm->incubation_length + lparm->infectious_length) {
+                            if (counter_ptr[i] >= (incubation_period_ptr[i] + infectious_period_ptr[i])) {
                                 status_ptr[i] = Status::immune;
                             }
                         }
@@ -1061,6 +1056,11 @@ void AgentContainer::infectAgents ()
             auto status_ptr = soa.GetIntData(IntIdx::status).data();
             auto counter_ptr = soa.GetRealData(RealIdx::disease_counter).data();
             auto prob_ptr = soa.GetRealData(RealIdx::prob).data();
+            auto incubation_period_ptr = soa.GetRealData(RealIdx::incubation_period).data();
+            auto infectious_period_ptr = soa.GetRealData(RealIdx::infectious_period).data();
+            auto symptomdev_period_ptr = soa.GetRealData(RealIdx::symptomdev_period).data();
+
+            auto* lparm = d_parm;
 
             amrex::ParallelForRNG( np,
             [=] AMREX_GPU_DEVICE (int i, amrex::RandomEngine const& engine) noexcept
@@ -1071,6 +1071,9 @@ void AgentContainer::infectAgents ()
                     if (amrex::Random(engine) < prob_ptr[i]) {
                         status_ptr[i] = Status::infected;
                         counter_ptr[i] = 0.0;
+                        incubation_period_ptr[i] = amrex::RandomNormal(lparm->incubation_length_mean, lparm->incubation_length_std, engine);
+                        infectious_period_ptr[i] = amrex::RandomNormal(lparm->infectious_length_mean, lparm->infectious_length_std, engine);
+                        symptomdev_period_ptr[i] = amrex::RandomNormal(lparm->symptomdev_length_mean, lparm->symptomdev_length_std, engine);
                         return;
                     }
                 }
@@ -1101,9 +1104,7 @@ void AgentContainer::infectAgents ()
         + If the agent is #Status::immune, do nothing.
         + If the agent is #Status::infected with the number of days infected (RealIdx::disease_counter)
           less than the #DiseaseParm::incubation_length, do nothing.
-        + If *i* is infected and *j* is not infected, compute probability of *j* getting infected from i
-          (see below).
-        + Else if *i* is not infected and *j* is infected, compute probability of *i* getting infected
+        + If *i* is not infected and *j* is infected, compute probability of *i* getting infected
           from *j* (see below).
 
     Summary of how the probability of agent A getting infected from agent B is computed:
@@ -1202,10 +1203,11 @@ void AgentContainer::interactAgentsHomeWork ( MultiFab& /*mask_behavior*/ /*!< M
             auto workgroup_ptr = soa.GetIntData(IntIdx::workgroup).data();
             auto prob_ptr = soa.GetRealData(RealIdx::prob).data();
             auto counter_ptr = soa.GetRealData(RealIdx::disease_counter).data();
+            auto incubation_period_ptr = soa.GetRealData(RealIdx::incubation_period).data();
+            //auto symptomdev_period_ptr = soa.GetRealData(RealIdx::symptomdev_period).data();
 
             auto* lparm = d_parm;
-            amrex::ParallelForRNG( bins_ptr->numItems(),
-                                   [=] AMREX_GPU_DEVICE (int ii, amrex::RandomEngine const& /*engine*/) noexcept
+            amrex::ParallelFor( bins_ptr->numItems(), [=] AMREX_GPU_DEVICE (int ii) noexcept
             {
                 auto i = inds[ii];
                 int i_cell = binner(pstruct_ptr[i]);
@@ -1215,114 +1217,20 @@ void AgentContainer::interactAgentsHomeWork ( MultiFab& /*mask_behavior*/ /*!< M
                 AMREX_ALWAYS_ASSERT( (Long) i < np);
                 if (status_ptr[i] == Status::immune) { return; }
                 if (status_ptr[i] == Status::dead) { return; }
-                if (status_ptr[i] == Status::infected && counter_ptr[i] < lparm->incubation_length) { return; }  // incubation stage
+                if (status_ptr[i] == Status::infected && counter_ptr[i] < incubation_period_ptr[i]) { return; }  // incubation stage
                 //amrex::Real i_mask = mask_arr(home_i_ptr[i], home_j_ptr[i], 0);
                 for (unsigned int jj = cell_start; jj < cell_stop; ++jj) {
                     auto j = inds[jj];
+                    if (i == j) {continue;}
                     AMREX_ALWAYS_ASSERT( (Long) j < np);
                     //amrex::Real j_mask = mask_arr(home_i_ptr[j], home_j_ptr[j], 0);
                     if (status_ptr[j] == Status::immune) {continue;}
                     if (status_ptr[j] == Status::dead) {continue;}
-                    if (status_ptr[j] == Status::infected && counter_ptr[j] < lparm->incubation_length) { continue; }  // incubation stage
+                    if (status_ptr[j] == Status::infected && counter_ptr[j] < incubation_period_ptr[j]) { continue; }  // incubation stage
 
-                    if (status_ptr[i] == Status::infected &&
-                        (status_ptr[j] != Status::infected && status_ptr[j] != Status::dead)) {
-                        // i can infect j
-                        amrex::Real infect = lparm->infect;
-                        infect *= lparm->vac_eff;
-                        //infect *= i_mask;
-                        //infect *= j_mask;
-
-                        amrex::Real social_scale = 1.0;  // TODO this should vary based on cell
-                        amrex::Real work_scale = 1.0;  // TODO this should vary based on cell
-
-                        auto prob = prob_ptr[j];
-                        /* Determine what connections these individuals have */
-                        if ((nborhood_ptr[i] == nborhood_ptr[j]) && (family_ptr[i] == family_ptr[j]) && (!DAYTIME)) {
-                            if (age_group_ptr[i] <= 1) {  /* Transmitter i is a child */
-                                if (school_ptr[i] < 0) { // not attending school, use _SC contacts
-                                    prob *= 1.0 - infect * lparm->xmit_child_SC[age_group_ptr[j]];
-                                } else {
-                                    prob *= 1.0 - infect * lparm->xmit_child[age_group_ptr[j]];
-                                }
-                            }
-                            else {
-                                if (school_ptr[i] < 0) { // not attending school, use _SC contacts
-                                    prob *= 1.0 - infect * lparm->xmit_adult_SC[age_group_ptr[j]];
-                                } else {
-                                    prob *= 1.0 - infect * lparm->xmit_adult[age_group_ptr[j]];
-                                }
-                            }
-                        }
-                        /* check for common neighborhood cluster: */
-                        else if ((nborhood_ptr[i] == nborhood_ptr[j]) && (!withdrawn_ptr[i]) && (!withdrawn_ptr[j]) && ((family_ptr[i] / 4) == (family_ptr[j] / 4)) && (!DAYTIME)) {
-                            if (age_group_ptr[i] <= 1) {  /* Transmitter i is a child */
-                                if (school_ptr[i] < 0)  // not attending school, use _SC contacts
-                                    prob *= 1.0 - infect * lparm->xmit_nc_child_SC[age_group_ptr[j]] * social_scale;
-                                else
-                                    prob *= 1.0 - infect * lparm->xmit_nc_child[age_group_ptr[j]] * social_scale;
-                            }
-                            else {
-                                if (school_ptr[i] < 0)  // not attending school, use _SC contacts
-                                    prob *= 1.0 - infect * lparm->xmit_nc_adult_SC[age_group_ptr[j]] * social_scale;
-                                else
-                                    prob *= 1.0 - infect * lparm->xmit_nc_adult[age_group_ptr[j]] * social_scale;
-                            }
-                        }
-
-                        // /* Home isolation or household quarantine? */
-                        if ( (!withdrawn_ptr[i]) && (!withdrawn_ptr[j]) ) {
-
-                            /* Should always be in the same community = same cell */
-                            if (school_ptr[i] < 0) {  // not attending school, use _SC contacts
-                                prob *= 1.0 - infect * lparm->xmit_comm_SC[age_group_ptr[j]] * social_scale;
-                            } else {
-                                prob *= 1.0 - infect * lparm->xmit_comm[age_group_ptr[j]] * social_scale;
-                            }
-
-                            /* Workgroup transmission */
-                            if (DAYTIME && workgroup_ptr[i] && (work_i_ptr[i] >= 0)) { // transmitter i at work
-                                if ((work_i_ptr[j] >= 0) && (workgroup_ptr[i] == workgroup_ptr[j])) {  // coworker
-                                    prob *= 1.0 - infect * lparm->xmit_work * work_scale;
-                                }
-                            }
-
-                            // /* Neighborhood? */
-                            if (nborhood_ptr[i] == nborhood_ptr[j]) {
-                                if (school_ptr[i] < 0)  // not attending school, use _SC contacts
-                                    prob *= 1.0 - infect * lparm->xmit_hood_SC[age_group_ptr[j]] * social_scale;
-                                else
-                                    prob *= 1.0 - infect * lparm->xmit_hood[age_group_ptr[j]] * social_scale;
-
-                                if ((school_ptr[i] == school_ptr[j]) && DAYTIME) {
-                                    if (school_ptr[i] > 5) {
-                                        /* Playgroup */
-                                        prob *= 1.0 - infect * lparm->xmit_school[6] * social_scale;
-                                    } else if (school_ptr[i] == 5) {
-                                        /* Day care */
-                                        prob *= 1.0 - infect * lparm->xmit_school[5] * social_scale;
-                                    }
-                                }
-                            }  /* same neighborhood */
-
-                            /* Elementary/middle/high school in common */
-                            if ((school_ptr[i] == school_ptr[j]) && DAYTIME &&
-                                (school_ptr[i] > 0) && (school_ptr[i] < 5)) {
-                                if (age_group_ptr[i] <= 1) {  /* Transmitter i is a child */
-                                    if (age_group_ptr[j] <= 1) {  /* Receiver j is a child */
-                                        prob *= 1.0 - infect * lparm->xmit_school[school_ptr[i]] * social_scale;
-                                    } else {  // Child student -> adult teacher/staff transmission
-                                        prob  *= 1.0 - infect * lparm->xmit_sch_c2a[school_ptr[i]] * social_scale;
-                                    }
-                                } else if (age_group_ptr[j] <= 1) {  // Adult teacher/staff -> child student
-                                    prob *= 1.0 - infect * lparm->xmit_sch_a2c[school_ptr[i]] * social_scale;
-                                }
-                            }
-                        }  /* within society */
-                        Gpu::Atomic::Multiply(&prob_ptr[j], prob);
-                    } else if (status_ptr[j] == Status::infected &&
-                               (status_ptr[i] != Status::infected && status_ptr[i] != Status::dead)) {
-                        if (counter_ptr[j] < lparm->incubation_length) { continue; }
+                    if (status_ptr[j] == Status::infected &&
+                        (status_ptr[i] != Status::infected && status_ptr[i] != Status::dead)) {
+                        if (counter_ptr[j] < incubation_period_ptr[j]) { continue; }
                         // j can infect i
                         amrex::Real infect = lparm->infect;
                         infect *= lparm->vac_eff;
@@ -1332,7 +1240,7 @@ void AgentContainer::interactAgentsHomeWork ( MultiFab& /*mask_behavior*/ /*!< M
                         amrex::Real social_scale = 1.0;  // TODO this should vary based on cell
                         amrex::Real work_scale = 1.0;  // TODO this should vary based on cell
 
-                        auto prob = prob_ptr[i];
+                        amrex::ParticleReal prob = 1.0;
                         /* Determine what connections these individuals have */
                         if ((nborhood_ptr[i] == nborhood_ptr[j]) && (family_ptr[i] == family_ptr[j]) && (! DAYTIME)) {
                             if (age_group_ptr[j] <= 1) {  /* Transmitter j is a child */
